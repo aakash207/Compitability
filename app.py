@@ -17,7 +17,7 @@ Run:
 from __future__ import annotations
 
 import json
-from datetime import datetime, time as dtime
+from datetime import datetime
 from math import atan2, cos, degrees, radians, sin, tan
 
 import pandas as pd
@@ -214,11 +214,19 @@ def _datetime_to_jd_utc(dt_utc: datetime) -> float:
 
 
 def compute_chart(date_str: str, time_str: str, place: str) -> dict:
-    """Compute sidereal planet longitudes + ascendant for one person."""
+    """Compute chart by geocoding place string (kept for CLI use)."""
     lat, lon, addr = resolve_place(place)
-    tz = tz_for_latlon(lat, lon)
+    tz_obj  = tz_for_latlon(lat, lon)
+    tz_name = str(tz_obj)
+    return compute_chart_from_coords(date_str, time_str, lat, lon, tz_name, addr)
 
-    naive = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+
+def compute_chart_from_coords(date_str: str, time_str: str,
+                               lat: float, lon: float,
+                               tz_name: str, place_label: str) -> dict:
+    """Compute sidereal planet longitudes + ascendant from explicit lat/lon/tz."""
+    tz       = pytz.timezone(tz_name)
+    naive    = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
     local_dt = tz.localize(naive)
     utc_dt   = local_dt.astimezone(pytz.UTC)
 
@@ -243,10 +251,10 @@ def compute_chart(date_str: str, time_str: str, place: str) -> dict:
                for p in PLANET_ORDER}
 
     return {
-        'place':      addr,
+        'place':      place_label,
         'lat':        lat,
         'lon':        lon,
-        'tz':         str(tz),
+        'tz':         tz_name,
         'local_dt':   local_dt.isoformat(),
         'utc_dt':     utc_dt.isoformat(),
         'jd':         jd,
@@ -347,7 +355,6 @@ def build_chart_text(p1: dict, p2: dict, lagna_sign: str, owner: int) -> str:
                 pct = ASPECT_PCT_RULES.get(p, {}).get(off)
                 aspects[target].append((p, who, pct))
 
-    owner_person = p1 if owner == 1 else p2
     lines = [f"=== CHART (House 1 = Person {owner}'s Lagna: {lagna_sign}) ==="]
     for n in range(1, 13):
         sg = house_sign[n]
@@ -368,8 +375,9 @@ def build_chart_text(p1: dict, p2: dict, lagna_sign: str, owner: int) -> str:
             asp_str = "No Aspects"
 
         lord = SIGN_LORDS[sg]
-        lord_house = sign_house.get(owner_person['planets'][lord]['sign'], '-')
-        lord_str = f"Lord: {lord} (placed in House {lord_house})"
+        lord_p1_house = sign_house.get(p1['planets'][lord]['sign'], '-')
+        lord_p2_house = sign_house.get(p2['planets'][lord]['sign'], '-')
+        lord_str = f"Lord: {lord} (P1: House {lord_p1_house}, P2: House {lord_p2_house})"
 
         lines.append(f"House {n} ({sg}): {occ_str} | {asp_str} | {lord_str}")
 
@@ -452,16 +460,62 @@ def _person_input(label: str, default_place: str, key_prefix: str):
                                  format="DD/MM/YYYY",
                                  key=f"{key_prefix}_dob")
     with col2:
-        time_val = st.time_input("Time of Birth",
-                                 value=dtime(12, 0),
+        time_str = st.text_input("Time of Birth (HH:MM, 24-hr)",
+                                 value="12:00",
+                                 placeholder="14:30",
                                  key=f"{key_prefix}_tob")
-    place_val = st.text_input("Place of Birth", value=default_place,
-                              key=f"{key_prefix}_pob")
+
+    # ── Place: live geocode search (mirrors logic.py) ────────────────
+    city_query = st.text_input("Place of Birth", value=default_place,
+                               placeholder="Start typing city name…",
+                               key=f"{key_prefix}_city")
+
+    lat, lon, resolved_place = None, None, city_query
+    search_key = f"{key_prefix}_geo_results"
+    if search_key not in st.session_state:
+        st.session_state[search_key] = []
+
+    if city_query and len(city_query) >= 2:
+        city_title = city_query.strip().title()
+        if city_title in CITIES_FALLBACK:
+            c = CITIES_FALLBACK[city_title]
+            lat, lon = c['lat'], c['lon']
+            resolved_place = city_title
+            st.session_state[search_key] = []
+        else:
+            try:
+                locs = _get_geocoder()(city_query, exactly_one=False, limit=5)
+                st.session_state[search_key] = [
+                    {'display': l.address, 'lat': l.latitude, 'lon': l.longitude}
+                    for l in (locs or [])
+                ]
+            except Exception:
+                st.session_state[search_key] = []
+
+    if lat is None and st.session_state[search_key]:
+        opts = [r['display'] for r in st.session_state[search_key]]
+        sel  = st.selectbox("Select location", options=opts, key=f"{key_prefix}_sel")
+        idx  = opts.index(sel)
+        lat  = st.session_state[search_key][idx]['lat']
+        lon  = st.session_state[search_key][idx]['lon']
+        resolved_place = sel
+    elif lat is None:
+        # Final fallback: Chennai
+        lat, lon = CITIES_FALLBACK['Chennai']['lat'], CITIES_FALLBACK['Chennai']['lon']
+        resolved_place = city_query or 'Chennai'
+
+    tf   = _get_timezone_finder()
+    tz_name = tf.timezone_at(lng=lon, lat=lat) or 'Asia/Kolkata'
+    st.caption(f"📍 Lat: {lat:.4f}, Lon: {lon:.4f} → TZ: **{tz_name}**")
+
     return {
         'name':  name,
         'date':  date_val.strftime("%Y-%m-%d"),
-        'time':  time_val.strftime("%H:%M"),
-        'place': place_val,
+        'time':  time_str.strip(),
+        'lat':   lat,
+        'lon':   lon,
+        'tz':    tz_name,
+        'place': resolved_place,
     }
 
 
@@ -485,10 +539,22 @@ def _run_app():
         st.info("Fill in both persons' details and click the button.")
         return
 
-    with st.spinner("Geocoding and computing both charts..."):
+    # Validate time inputs before computing
+    for label, inp in ((p1_in['name'], p1_in), (p2_in['name'], p2_in)):
         try:
-            p1 = compute_chart(p1_in['date'], p1_in['time'], p1_in['place'])
-            p2 = compute_chart(p2_in['date'], p2_in['time'], p2_in['place'])
+            datetime.strptime(inp['time'], "%H:%M")
+        except ValueError:
+            st.error(f"Invalid time for {label}: {inp['time']!r}. Use HH:MM format (e.g. 14:30).")
+            return
+
+    with st.spinner("Computing both charts..."):
+        try:
+            p1 = compute_chart_from_coords(
+                p1_in['date'], p1_in['time'], p1_in['lat'], p1_in['lon'],
+                p1_in['tz'], p1_in['place'])
+            p2 = compute_chart_from_coords(
+                p2_in['date'], p2_in['time'], p2_in['lat'], p2_in['lon'],
+                p2_in['tz'], p2_in['place'])
         except Exception as exc:
             st.error(f"Computation failed: {exc}")
             return
