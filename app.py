@@ -593,6 +593,8 @@ def _run_app():
         key="dl_export",
     )
 
+
+if __name__ == "__main__":
     try:
         import streamlit.runtime.scriptrunner as _ssr  # noqa: F401
         _run_app()
@@ -610,3 +612,7 @@ def _run_app():
         print(build_chart_text(demo_p1, demo_p2, demo_p1['asc_sign'], owner=1))
         print()
         print(build_chart_text(demo_p1, demo_p2, demo_p2['asc_sign'], owner=2))
+else:
+    # Called by `streamlit run` — Streamlit executes module-level code directly.
+    _run_app()
+
