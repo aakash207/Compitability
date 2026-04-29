@@ -16,6 +16,7 @@ Run:
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, time as dtime
 from math import atan2, cos, degrees, radians, sin, tan
 
@@ -84,6 +85,82 @@ CITIES_FALLBACK = {
     'Kolkata':   {'lat': 22.57, 'lon': 88.36},
     'Hyderabad': {'lat': 17.39, 'lon': 78.49},
 }
+
+# ──────────────────────────────────────────────────────────────────────
+# Status / Parivardhana tables (mirrors daily_nps.py / logic.py)
+# ──────────────────────────────────────────────────────────────────────
+
+STATUS_DATA = {
+    'Sun':     {'Uchcham': 'Aries',      'Moolathirigonam': None,          'Aatchi': 'Leo',        'Neecham': 'Libra'},
+    'Moon':    {'Uchcham': 'Taurus',     'Moolathirigonam': None,          'Aatchi': 'Cancer',     'Neecham': 'Scorpio'},
+    'Jupiter': {'Uchcham': 'Cancer',     'Moolathirigonam': 'Sagittarius', 'Aatchi': 'Pisces',     'Neecham': 'Capricorn'},
+    'Venus':   {'Uchcham': 'Pisces',     'Moolathirigonam': 'Libra',       'Aatchi': 'Taurus',     'Neecham': 'Virgo'},
+    'Mercury': {'Uchcham': 'Virgo',      'Moolathirigonam': None,          'Aatchi': 'Gemini',     'Neecham': 'Pisces'},
+    'Mars':    {'Uchcham': 'Capricorn',  'Moolathirigonam': 'Aries',       'Aatchi': 'Scorpio',    'Neecham': 'Cancer'},
+    'Saturn':  {'Uchcham': 'Libra',      'Moolathirigonam': 'Aquarius',    'Aatchi': 'Capricorn',  'Neecham': 'Aries'},
+}
+
+# Uchcham sign for each planet — used for Neechabhangam co-occupant check
+_UCHCHA_SIGN = {p: v['Uchcham'] for p, v in STATUS_DATA.items()}
+
+
+def _planet_status(planet: str, sign: str) -> str:
+    """Return base status string for a planet in the given sign."""
+    m = STATUS_DATA.get(planet)
+    if not m:
+        return '-'
+    if sign == m['Uchcham']:
+        return 'Uchcham'
+    if sign == m['Neecham']:
+        return 'Neecham'
+    if m['Moolathirigonam'] and sign == m['Moolathirigonam']:
+        return 'Moolathirigonam'
+    if sign == m['Aatchi']:
+        return 'Aatchi'
+    return '-'
+
+
+def compute_statuses(planets: dict) -> dict[str, str]:
+    """Return {planet: final_status} including Neechabhangam upgrades."""
+    base = {p: _planet_status(p, planets[p]['sign']) for p in PLANET_ORDER
+            if p not in ('Rahu', 'Ketu')}
+    base['Rahu'] = '-'
+    base['Ketu'] = '-'
+
+    updated = dict(base)
+    for p, status in base.items():
+        if status != 'Neecham':
+            continue
+        sign = planets[p]['sign']
+        house_lord = SIGN_LORDS[sign]
+        lord_status = base.get(house_lord, '-')
+        if lord_status in ('Uchcham', 'Moolathirigonam', 'Aatchi'):
+            updated[p] = 'Neechabhangam'
+            continue
+        # Co-occupant with Uchcham or Moolathirigonam planet in same sign
+        for other, other_sign in ((q, planets[q]['sign']) for q in PLANET_ORDER):
+            if other == p:
+                continue
+            if other_sign == sign and base.get(other, '-') in ('Uchcham', 'Moolathirigonam'):
+                updated[p] = 'Neechabhangam'
+                break
+
+    return updated
+
+
+def compute_parivardhana(planets: dict) -> dict[str, str]:
+    """Return {planet: exchange_partner} for mutual sign-lord pairs."""
+    pmap = {}
+    for pa in ('Sun', 'Moon', 'Mars', 'Mercury', 'Jupiter', 'Venus', 'Saturn'):
+        sg_a   = planets[pa]['sign']
+        lord_a = SIGN_LORDS[sg_a]
+        if lord_a not in planets:
+            continue
+        sg_lord   = planets[lord_a]['sign']
+        lord_back = SIGN_LORDS[sg_lord]
+        if lord_back == pa and pa != lord_a:
+            pmap[pa] = lord_a
+    return pmap
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -303,6 +380,66 @@ def build_chart_text(p1: dict, p2: dict, lagna_sign: str, owner: int) -> str:
 # Streamlit UI
 # ──────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────
+# Export text builder
+# ──────────────────────────────────────────────────────────────────────
+
+def build_export_text(p1: dict, p2: dict,
+                      p1_name: str, p2_name: str,
+                      p1_statuses: dict, p2_statuses: dict,
+                      p1_pari: dict, p2_pari: dict) -> str:
+    """Build the full copyable export string."""
+    lines: list[str] = []
+
+    # ── Header ──────────────────────────────────────────────────────
+    lines.append("=== SYNASTRY CHART EXPORT ===")
+    lines.append("")
+
+    # ── Lagna & Rasi summary ────────────────────────────────────────
+    lines.append(f"Person 1 ({p1_name})")
+    lines.append(f"  Lagna : {p1['asc_sign']}")
+    lines.append(f"  Rasi  : {p1['moon_sign']}")
+    lines.append("")
+    lines.append(f"Person 2 ({p2_name})")
+    lines.append(f"  Lagna : {p2['asc_sign']}")
+    lines.append(f"  Rasi  : {p2['moon_sign']}")
+    lines.append("")
+
+    # ── Planetary positions for each person ─────────────────────────
+    for who, label, person, statuses, pari in (
+        (1, p1_name, p1, p1_statuses, p1_pari),
+        (2, p2_name, p2, p2_statuses, p2_pari),
+    ):
+        lines.append(f"--- Person {who} ({label}) Planetary Positions ---")
+        lines.append(f"Asc: Sign: {person['asc_sign']} | Deg: {person['asc_long']:.2f}")
+        for p in PLANET_ORDER:
+            d     = person['planets'][p]
+            parts = [f"Sign: {d['sign']}", f"Deg: {d['longitude']:.2f}"]
+
+            st_val = statuses.get(p, '-')
+            if st_val and st_val != '-':
+                parts.append(f"Status: {st_val}")
+
+            if p in pari:
+                partner  = pari[p]
+                h_self   = SIGN_NAMES.index(d['sign']) + 1          # sign index as house proxy
+                h_partner = SIGN_NAMES.index(person['planets'][partner]['sign']) + 1
+                parts.append(f"Parivardhana: {partner}")
+
+            lines.append(f"{p}: {' | '.join(parts)}")
+        lines.append("")
+
+    # ── Chart 1 (P1 Lagna as House 1) ───────────────────────────────
+    lines.append(build_chart_text(p1, p2, p1['asc_sign'], owner=1))
+    lines.append("")
+
+    # ── Chart 2 (P2 Lagna as House 1) ───────────────────────────────
+    lines.append(build_chart_text(p1, p2, p2['asc_sign'], owner=2))
+    lines.append("")
+
+    return "\n".join(lines)
+
+
 def _person_input(label: str, default_place: str, key_prefix: str):
     st.markdown(f"### {label}")
     name = st.text_input("Name", value=label, key=f"{key_prefix}_name")
@@ -426,8 +563,36 @@ def _run_app():
     with st.expander("Preview Chart 2 text"):
         st.text(txt2)
 
+    # ── Combined Export ──────────────────────────────────────────────
+    st.divider()
+    st.subheader("Export — Combined Chart Data")
+    st.caption(
+        "Full export: Lagna, Rasi, planetary positions (with Status and "
+        "Parivardhana), and both house charts. Copy from the box or download."
+    )
 
-if __name__ == "__main__":
+    p1_statuses = compute_statuses(p1['planets'])
+    p2_statuses = compute_statuses(p2['planets'])
+    p1_pari     = compute_parivardhana(p1['planets'])
+    p2_pari     = compute_parivardhana(p2['planets'])
+
+    export_txt = build_export_text(
+        p1, p2,
+        p1_in['name'], p2_in['name'],
+        p1_statuses, p2_statuses,
+        p1_pari, p2_pari,
+    )
+
+    st.text_area("Copy Export", value=export_txt, height=400,
+                 label_visibility="collapsed")
+    st.download_button(
+        "⬇ Download Export (.txt)",
+        data=export_txt,
+        file_name=f"synastry_{p1['asc_sign']}_{p2['asc_sign']}.txt",
+        mime="text/plain",
+        key="dl_export",
+    )
+
     try:
         import streamlit.runtime.scriptrunner as _ssr  # noqa: F401
         _run_app()
